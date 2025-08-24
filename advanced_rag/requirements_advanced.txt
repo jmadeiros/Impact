@@ -1,0 +1,33 @@
+# Advanced RAG Requirements - Isolated from main system
+# Using specific versions to avoid conflicts
+
+# Core Langchain
+langchain==0.1.0
+langchain-community==0.0.13
+langchain-core==0.1.7
+
+# Vector stores
+chromadb==0.4.22
+faiss-cpu==1.7.4
+
+# Embeddings
+sentence-transformers==2.2.2
+openai==1.6.1
+
+# Google AI
+langchain-google-genai==0.0.8
+google-generativeai==0.3.2
+
+# Database
+supabase==2.3.0
+psycopg2-binary==2.9.9
+
+# API
+fastapi==0.108.0
+uvicorn==0.25.0
+
+# Utils
+python-dotenv==1.0.0
+pydantic==2.5.3
+numpy==1.24.3
+pandas==2.1.4
