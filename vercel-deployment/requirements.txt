@@ -1,5 +1,2 @@
-# Minimal requirements for Vercel deployment
-# Only essential packages to get basic functionality working
-
-# No dependencies needed for basic health check
-# Add dependencies as needed for other endpoints
+# Truly minimal requirements for basic health endpoints
+# No external dependencies needed
