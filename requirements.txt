@@ -1,9 +1,36 @@
+# Impact Intelligence Platform - Unified Requirements
+# Supports both Simple and Advanced RAG systems
+
+# Core API Framework
 fastapi>=0.100.0
 uvicorn>=0.20.0
-langchain>=0.1.0
-langchain-google-genai>=0.1.0
-langchain-community>=0.0.20
-supabase>=2.0.0
-python-dotenv>=1.0.0
 pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Database
+supabase>=2.0.0
+psycopg2-binary>=2.9.9
 pgvector>=0.2.0
+
+# Core Langchain (for both systems)
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-core>=0.1.7
+langchain-google-genai>=0.0.8
+
+# Google AI
+google-generativeai>=0.3.2
+
+# Advanced RAG Dependencies (optional - only needed for advanced system)
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.4
+
+# Utilities
+numpy>=1.24.3
+pandas>=2.1.4
+requests>=2.31.0
+
+# Development/Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
