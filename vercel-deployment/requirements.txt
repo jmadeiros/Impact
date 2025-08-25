@@ -1,0 +1,27 @@
+# Vercel-Optimized Requirements for Advanced RAG System
+# Minimal dependencies for fast cold starts and efficient memory usage
+
+# Core AI/ML Libraries
+langchain==0.1.0
+langchain-core==0.1.7
+langchain-google-genai==0.0.8
+google-generativeai==0.3.2
+sentence-transformers==2.2.2
+
+# Vector Stores
+pinecone-client==2.2.4
+supabase==2.3.0
+
+# Essential Dependencies
+numpy==1.24.3
+pydantic==2.5.3
+python-dotenv==1.0.0
+
+# Optional Performance Libraries (lightweight versions)
+psutil==5.9.6
+
+# Note: Removed heavy dependencies for Vercel optimization:
+# - chromadb (replaced with external vector stores)
+# - faiss-cpu (using Pinecone instead)
+# - pandas (not needed for core functionality)
+# - uvicorn/fastapi (Vercel handles HTTP layer)

@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "name": "rag-survey-system",
+  "builds": [
+    {
+      "src": "api/*.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/health"
+    }
+  ],
+  "functions": {
+    "api/*.py": {
+      "runtime": "python3.9",
+      "maxDuration": 25
+    }
+  },
+  "env": {
+    "PYTHONPATH": "./lib"
+  }
+}
