@@ -1,39 +1,31 @@
 {
-  "version": 2,
-  "name": "rag-survey-system",
-  "builds": [
-    {
-      "src": "vercel-deployment/api/health.py",
-      "use": "@vercel/python"
+  "functions": {
+    "vercel-deployment/api/health.py": {
+      "runtime": "@vercel/python"
     },
-    {
-      "src": "vercel-deployment/api/test.py",
-      "use": "@vercel/python"
+    "vercel-deployment/api/test.py": {
+      "runtime": "@vercel/python"
     },
-    {
-      "src": "vercel-deployment/api/simple-health.py",
-      "use": "@vercel/python"
+    "vercel-deployment/api/simple-health.py": {
+      "runtime": "@vercel/python"
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/api/health",
-      "dest": "/vercel-deployment/api/health"
+      "source": "/api/health",
+      "destination": "/vercel-deployment/api/health"
     },
     {
-      "src": "/api/test",
-      "dest": "/vercel-deployment/api/test"
+      "source": "/api/test",
+      "destination": "/vercel-deployment/api/test"
     },
     {
-      "src": "/api/simple-health",
-      "dest": "/vercel-deployment/api/simple-health"
+      "source": "/api/simple-health",
+      "destination": "/vercel-deployment/api/simple-health"
     },
     {
-      "src": "/(.*)",
-      "dest": "/vercel-deployment/api/health"
+      "source": "/(.*)",
+      "destination": "/vercel-deployment/api/health"
     }
-  ],
-  "env": {
-    "PYTHONPATH": "./vercel-deployment/lib"
-  }
+  ]
 }
