@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RAG Survey System</title>
+</head>
+<body>
+    <h1>RAG Survey System</h1>
+    <p>API Health Check: <a href="/api/health">/api/health</a></p>
+    <script>
+        // Test the health endpoint
+        fetch('/api/health')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Health check:', data);
+                document.body.innerHTML += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.body.innerHTML += '<p>Error: ' + error + '</p>';
+            });
+    </script>
+</body>
+</html>
