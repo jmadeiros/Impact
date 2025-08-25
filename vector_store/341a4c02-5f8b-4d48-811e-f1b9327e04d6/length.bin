@@ -1,0 +1,399 @@
+else:
+            lm_logits = self.lm_head(sequence_output)
+
+        if not return_dict:
+            return (lm_logits,) + decoder_outputs[1:] + encoder_outputs
+
+        return FlaxSeq2SeqLMOutput(
+            logits=lm_logits,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+
+class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
+    module_class = FlaxT5ForConditionalGenerationModule
+
+    @add_start_docstrings(T5_DECODE_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=FlaxCausalLMOutputWithCrossAttentions, config_class=T5Config)
+    def decode(
+        self,
+        decoder_input_ids,
+        encoder_outputs,
+        encoder_attention_mask: Optional[jnp.ndarray] = None,
+        decoder_attention_mask: Optional[jnp.ndarray] = None,
+        past_key_values: Optional[dict] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: Optional[dict] = None,
+        dropout_rng: PRNGKey = None,
+    ):
+        r"""
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, FlaxT5ForConditionalGeneration
+        >>> import jax.numpy as jnp
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
+        >>> model = FlaxT5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+
+        >>> text = "summarize: My friends are cool but they eat too many carbs."
+        >>> inputs = tokenizer(text, return_tensors="np")
+        >>> encoder_outputs = model.encode(**inputs)
+
+        >>> decoder_start_token_id = model.config.decoder_start_token_id
+        >>> decoder_input_ids = jnp.ones((inputs.input_ids.shape[0], 1), dtype="i4") * decoder_start_token_id
+
+        >>> outputs = model.decode(decoder_input_ids, encoder_outputs)
+        >>> logits = outputs.logits
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        encoder_hidden_states = encoder_outputs[0]
+        if encoder_attention_mask is None:
+            batch_size, sequence_length = encoder_hidden_states.shape[:2]
+            encoder_attention_mask = jnp.ones((batch_size, sequence_length))
+
+        batch_size, sequence_length = decoder_input_ids.shape
+        if decoder_attention_mask is None:
+            decoder_attention_mask = jnp.ones((batch_size, sequence_length))
+
+        # Handle any PRNG if needed
+        rngs = {}
+        if dropout_rng is not None:
+            rngs["dropout"] = dropout_rng
+
+        inputs = {"params": params or self.params}
+
+        # if past_key_values are passed then cache is already initialized a private flag init_cache has to be
+        # passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that
+        # it can be changed by FlaxT5Attention module
+        if past_key_values:
+            inputs["cache"] = past_key_values
+            mutable = ["cache"]
+        else:
+            mutable = False
+
+        def _decoder_forward(module, decoder_input_ids, decoder_attention_mask, **kwargs):
+            decoder_module = module._get_decoder_module()
+            decoder_outputs = decoder_module(
+                decoder_input_ids,
+                decoder_attention_mask,
+                **kwargs,
+            )
+
+            sequence_output = decoder_outputs[0]
+
+            if self.config.tie_word_embeddings:
+                # Rescale output before projecting on vocab
+                # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
+                sequence_output = sequence_output * (self.config.d_model**-0.5)
+
+            if self.config.tie_word_embeddings:
+                shared_embedding = module.shared.variables["params"]["embedding"]
+                lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding.T}}, sequence_output)
+            else:
+                lm_logits = module.lm_head(sequence_output)
+
+            return lm_logits, decoder_outputs
+
+        outputs = self.module.apply(
+            inputs,
+            decoder_input_ids=jnp.array(decoder_input_ids, dtype="i4"),
+            decoder_attention_mask=jnp.array(decoder_attention_mask, dtype="i4"),
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=jnp.array(encoder_attention_mask, dtype="i4"),
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            deterministic=not train,
+            rngs=rngs,
+            mutable=mutable,
+            method=_decoder_forward,
+        )
+
+        if past_key_values is None:
+            lm_logits, decoder_outputs = outputs
+        else:
+            (lm_logits, decoder_outputs), past = outputs
+
+        if return_dict:
+            outputs = FlaxCausalLMOutputWithCrossAttentions(
+                logits=lm_logits,
+                hidden_states=decoder_outputs.hidden_states,
+                attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+            )
+        else:
+            outputs = (lm_logits,) + decoder_outputs[1:]
+
+        # add updated cache to model output
+        if past_key_values is not None and return_dict:
+            outputs["past_key_values"] = unfreeze(past["cache"])
+            return outputs
+        elif past_key_values is not None and not return_dict:
+            outputs = outputs[:1] + (unfreeze(past["cache"]),) + outputs[1:]
+
+        return outputs
+
+    def prepare_inputs_for_generation(
+        self,
+        decoder_input_ids,
+        max_length,
+        attention_mask: Optional[jax.Array] = None,
+        decoder_attention_mask: Optional[jax.Array] = None,
+        encoder_outputs=None,
+        **kwargs,
+    ):
+        # initializing the cache
+        batch_size, seq_length = decoder_input_ids.shape
+
+        past_key_values = self.init_cache(batch_size, max_length, encoder_outputs)
+        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
+        # But since the decoder uses a causal mask, those positions are masked anyways.
+        # Thus we can create a single static attention_mask here, which is more efficient for compilation
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        if decoder_attention_mask is not None:
+            extended_attention_mask = jax.lax.dynamic_update_slice(
+                extended_attention_mask, decoder_attention_mask, (0, 0)
+            )
+
+        return {
+            "past_key_values": past_key_values,
+            "encoder_outputs": encoder_outputs,
+            "encoder_attention_mask": attention_mask,
+            "decoder_attention_mask": extended_attention_mask,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        return model_kwargs
+
+
+FLAX_T5_CONDITIONAL_GENERATION_DOCSTRING = """
+    Returns:
+
+    Example:
+
+    ```python
+    >>> from transformers import AutoTokenizer, FlaxT5ForConditionalGeneration
+
+    >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
+    >>> model = FlaxT5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+
+    >>> ARTICLE_TO_SUMMARIZE = "summarize: My friends are cool but they eat too many carbs."
+    >>> inputs = tokenizer([ARTICLE_TO_SUMMARIZE], return_tensors="np")
+
+    >>> # Generate Summary
+    >>> summary_ids = model.generate(inputs["input_ids"]).sequences
+    >>> print(tokenizer.decode(summary_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False))
+    ```
+"""
+
+
+overwrite_call_docstring(
+    FlaxT5ForConditionalGeneration, T5_INPUTS_DOCSTRING + FLAX_T5_CONDITIONAL_GENERATION_DOCSTRING
+)
+append_replace_return_docstrings(
+    FlaxT5ForConditionalGeneration, output_type=FlaxSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC
+)
+
+
+__all__ = ["FlaxT5EncoderModel", "FlaxT5ForConditionalGeneration", "FlaxT5Model", "FlaxT5PreTrainedModel"]
+ )r¶  rª   r«   rÅ   r^  s        rD   rT  zTarFile.taropenY  s-   € ğ Ğ+Ñ+ÜĞ@ÓAĞAÙ4˜˜wÑ1¨&Ñ1Ğ1rF   c                 ó  — |dvrt        d«      ‚	 ddlm} 	  |||dz   ||«      }	  | j                  |||fi |¤}d
+|_	        |S # t        $ r t	        d«      d‚w xY w# t
+        $ r}||dk(  rt        d	«      |‚‚ d}~ww xY w# t
+        $ r'}|j                  «        |dk(  rt        d	«      |‚‚ d}~w |j                  «        ‚ xY w)zkOpen gzip compressed tar archive name for reading or writing.
+           Appending is not allowed.
+        ©rŸ   r    r  úmode must be 'r', 'w' or 'x'r   )ÚGzipFilezgzip module is not availableNr|   rŸ   rñ   F)
+r<   Úgzipri  rÉ   r	   rÒ   r   rT  r¯   rÁ   )	r¶  rª   r«   rÅ   rØ   r^  ri  r  r  s	            rD   ÚgzopenzTarFile.gzopena  só   € ğ
+ Ñ&ÜĞ;Ó<Ğ<ğ	Mİ%ğ	Ù˜t T¨C¡Z°ÀÓHˆGğ		Ø—‘˜D $¨Ñ:°6Ñ:ˆAğ ˆŒØˆøô+ ò 	MÜ"Ğ#AÓBÈĞLğ	Mûô
+ ò 	ØĞ" t¨s¢{ÜĞ 1Ó2¸Ğ9Øûğ	ûô ò 	ØM‰MŒOØsŠ{ÜĞ 1Ó2¸Ğ9Øûğ	ØM‰MŒOØús9   ‘A ˜A §B ÁAÁ	B Á'A;Á;B Â	CÂ"B.Â.Cc                 óP  — |dvrt        d«      ‚	 ddlm}  ||xs |||¬«      }	  | j
+                  |||fi |¤}d
+|_
+        |S # t        $ r t	        d«      d‚w xY w# t        t        f$ r'}|j                  «        |dk(  rt        d	«      |‚‚ d}~w |j                  «        ‚ xY w)zlOpen bzip2 compressed tar archive name for reading or writing.
+           Appending is not allowed.
+        rg  rh  r   )ÚBZ2Filer¼   N)rØ   rŸ   znot a bzip2 fileF)r<   r»   rm  rÉ   r	   rT  rÒ   ÚEOFErrorr¯   r   rÁ   )	r¶  rª   r«   rÅ   rØ   r^  rm  r  r  s	            rD   Úbz2openzTarFile.bz2open‚  sÅ   € ğ
+ Ñ&ÜĞ;Ó<Ğ<ğ	Lİ#ñ ˜'š/ T¨4¸}ÔMˆğ		Ø—‘˜D $¨Ñ:°6Ñ:ˆAğ ˆŒØˆøô! ò 	LÜ"Ğ#@ÓAÀtĞKğ	Lûô œĞ"ò 	ØM‰MŒOØsŠ{ÜĞ 2Ó3¸Ğ:Øûğ	ØM‰MŒOØús"   ‘A §A ÁAÁB%Á-"BÂB%c                 óL  — |dvrt        d«      ‚	 ddlm}m}  ||xs |||¬«      }	  | j                  |||fi |¤}d
+|_
+        |S # t        $ r t        d«      d‚w xY w# |t        f$ r'}	|j                  «        |dk(  rt        d	«      |	‚‚ d}	~	w |j                  «        ‚ xY w)zkOpen lzma compressed tar archive name for reading or writing.
+           Appending is not allowed.
+        rg  rh  r   )ÚLZMAFilerÖ   r¾   N)ÚpresetrŸ   znot an lzma fileF)r<   rÔ   rq  rÖ   rÉ   r	   rT  rn  r¯   r   rÁ   )
+r¶  rª   r«   rÅ   rr  r^  rq  rÖ   r  r  s
+             rD   ÚxzopenzTarFile.xzopen  sÅ   € ğ
+ Ñ&ÜĞ;Ó<Ğ<ğ	Mß0ñ ˜7š? d¨D¸Ô@ˆğ		Ø—‘˜D $¨Ñ:°6Ñ:ˆAğ ˆŒØˆøô! ò 	MÜ"Ğ#AÓBÈĞLğ	Mûğ œ8Ğ$ò 	ØM‰MŒOØsŠ{ÜĞ 2Ó3¸Ğ:Øûğ	ØM‰MŒOØús"   ‘A ©A  ÁAÁ B#Á+"BÂB#rT  rk  ro  rs  )r¿   rº   r»   r½   c                 ó  — | j                   ryd| _         	 | j                  dv r| j                  j                  t        t
+        dz  z  «       | xj                  t
+        dz  z  c_        t        | j                  t        «      \  }}|dkD  r)| j                  j                  t        t        |z
+  z  «       | j                  s| j                  j                  «        yy# | j                  s| j                  j                  «        w w xY w)zlClose the TarFile. In write-mode, two finishing zero blocks are
+           appended to the archive.
+        NTrB  r.   r   )rÇ   r«   rÅ   ru   r?   r  r  rs   Ú
+RECORDSIZErÁ   r¯   )r©   rz   r{   s      rD   r¯   zTarFile.closeÅ  sÊ   € ğ ;Š;ØàˆŒğ	%Øy‰y˜OÑ+Ø—‘×"Ñ"¤3¬)°a©-Ñ#8Ô9Ø—’¤	¨A¡Ñ.•ô %+¨4¯;©;¼
+Ó$CÑ!˜	Ø˜q’=Ø—L‘L×&Ñ&¤s¬j¸9Ñ.DÑ'EÔFà×#Ò#Ø—‘×"Ñ"Õ$ğ $ø4×#Ò#Ø—‘×"Ñ"Õ$ğ $ús   –BC Ã)Dc                 óf   — | j                  |j                  d«      «      }|€t        d|z  «      ‚|S )a  Return a TarInfo object for member `name'. If `name' can not be
+           found in the archive, KeyError is raised. If a member occurs more
+           than once in the archive, its last occurrence is assumed to be the
+           most up-to-date version.
+        rW  zfilename %r not found)Ú
+_getmemberrÜ  ÚKeyError)r©   rª   r>  s      rD   Ú	getmemberzTarFile.getmemberÚ  s6   € ğ —/‘/ $§+¡+¨cÓ"2Ó3ˆØˆ?ÜĞ2°TÑ9Ó:Ğ:ØˆrF   c                 ór   — | j                  «        | j                  s| j                  «        | j                  S )zReturn the members of the archive as a list of TarInfo objects. The
+           list has the same order as the members in the archive.
+        )Ú_checkrM  Ú_loadrL  r°   s    rD   Ú
+getmemberszTarFile.getmemberså  s'   € ğ 	‰ŒØ|Š|ØJ‰JŒLà|‰|ĞrF   c                 ó\   — | j                  «       D cg c]  }|j                  ‘Œ c}S c c}w )z‹Return the members of the archive as a list of their names. It has
+           the same order as the list returned by getmembers().
+        )r}  rª   )r©   r>  s     rD   ÚgetnameszTarFile.getnamesï  s)   € ğ -1¯O©OÔ,=Ó>Ñ,= —“Ğ,=Ñ>Ğ>ùÒ>s   “)c                 ó.  — | j                  d«       ||j                  }|€|}t        j                  j	                  |«      \  }}|j                  t        j                  d«      }|j                  d«      }| j                  «       }| |_	        |€8| j                  st        j                  |«      }n9t        j                  |«      }n#t        j                  |j                  «       «      }d}|j                  }t        j                   |«      r„|j"                  |j$                  f}	| j                  sE|j&                  dkD  r6|	| j(                  v r(|| j(                  |	   k7  rt*        }
+| j(                  |	   }n½t,        }
+|	d   r²|| j(                  |	<   n¢t        j.                  |«      rt0        }
+n†t        j2                  |«      rt4        }
+njt        j6                  |«      rt8        }
+t        j:                  |«      }n9t        j<                  |«      rt>        }
+nt        j@                  |«      rtB        }
+ny||_        ||_"        |jF                  |_$        |jJ                  |_&        |
+t,        k(  r|jN                  |_(        nd|_(        |jR                  |_*        |
+|_+        ||_,        tZ        r(	 t[        j\                  |jH                  «      d   |_/        tb        r(	 tc        jd                  |jL                  «      d   |_3        |
+t>        tB        fv rhti        t        d«      rXti        t        d«      rHt        jj                  |jl                  «      |_7        t        jp                  |jl                  «      |_9        |S # t`        $ r Y Œ±w xY w# t`        $ r Y Œ’w xY w)	aÒ  Create a TarInfo object from the result of os.stat or equivalent
+           on an existing file. The file is either named by `name', or
+           specified as a file object `fileobj' with a file descriptor. If
+           given, `arcname' specifies an alternative name for the file in the
+           archive, otherwise, the name is taken from the 'name' attribute of
+           'fileobj', or the 'name' argument. The name should be a text
+           string.
+        ÚawxNrW  r¹   r-   r   ÚmajorÚminor):r{  rª   r¢   r/   Ú
+splitdriverß   r[  r\  r>  r=  rG  ÚlstatÚstatÚfstatÚfilenoÚst_modeÚS_ISREGÚst_inoÚst_devÚst_nlinkrN  r(  r{  ÚS_ISDIRr  ÚS_ISFIFOr.  ÚS_ISLNKr&  ÚreadlinkÚS_ISCHRr¾  ÚS_ISBLKr¿  r«   Úst_uidr3   Úst_gidr4   Úst_sizer1   Úst_mtimer2   rt  rc  ÚpwdÚgetpwuidr5   rx  ÚgrpÚgetgrgidr6   r§   r‚  Úst_rdevru  rƒ  rv  )r©   rª   ÚarcnamerÅ   Údrvr>  Ústatresrc  ÚstmdÚinodert  s              rD   Ú
+gettarinfozTarFile.gettarinfoõ  sÆ  € ğ 	‰EÔğ ĞØ—<‘<ˆDğ
+ ˆ?ØˆGÜ—w‘w×)Ñ)¨'Ó2‰ˆˆWØ—/‘/¤"§&¡&¨#Ó.ˆØ—.‘. Ó%ˆğ —,‘,“.ˆØˆŒğ ˆ?Ø×#Ò#ÜŸ(™( 4›.‘äŸ'™' $›-‘ä—h‘h˜wŸ~™~Ó/Ó0ˆGØˆà‰ˆÜ<‰<˜ÔØ—^‘^ W§^¡^Ğ4ˆEØ×#Ò#¨×(8Ñ(8¸1Ò(<Ø˜TŸ[™[Ñ(¨W¸¿¹ÀEÑ8JÒ-Jô ØŸ;™; uÑ-‘ô Ø˜’8Ø)0D—K‘K Ò&Ü\‰\˜$ÔÜ‰DÜ]‰]˜4Ô Ü‰DÜ\‰\˜$ÔÜˆDÜ—{‘{ 4Ó(‰HÜ\‰\˜$ÔÜ‰DÜ\‰\˜$ÔÜ‰Dàğ ˆŒØˆŒØ—n‘nˆŒØ—n‘nˆŒØ”7Š?Ø"Ÿ?™?ˆGLàˆGŒLØ×(Ñ(ˆŒØˆŒØ#ˆÔİğÜ #§¡¨W¯[©[Ó 9¸!Ñ <”õ ğÜ #§¡¨W¯[©[Ó 9¸!Ñ <”ğ ”GœWĞ%Ñ%Ü”r˜7Ô#¬´°GÔ(<Ü#%§8¡8¨G¯O©OÓ#<Ô Ü#%§8¡8¨G¯O©OÓ#<Ô Øˆøô ò Ùğûô
+ ò Ùğús$   Ê,'M9 Ë'N Í9	NÎNÎ	NÎN)rL  c                óœ  — | j                  «        |€| }|D ]²  }|r&|j                  €t        d«       n(t        t        j                  |j                  «      «       t        |j
+                  xs |j                  ›d|j                  xs |j                  ›«       |j                  «       s|j                  «       r(t        dd|j                  |j                  fz  z  «       nt        d|j                  z  «       |j                  €t        d«       n.t        dt        j                   |j                  «      dd	 z  «       t        |j"                  |j%                  «       rdnd
+z   «       |rP|j'                  «       rt        d|j(                  z   «       |j+                  «       rt        d|j(                  z   «       t-        «        Œµ y)a  Print a table of contents to sys.stdout. If `verbose' is False, only
+           the names of the members are printed. If it is True, an `ls -l'-like
+           output is produced. `members' is optional and must be a subset of the
+           list returned by getmembers().
+        Nz
+??????????rW  z%10sz%d,%dz%10dz????-??-?? ??:??:??z%d-%02d-%02d %02d:%02d:%02dró   r¹   z-> zlink to )r{  r«   r…   r†  rc  r5   r3   r6   r4   r*  r,  ru  rv  r1   r2   rå   Ú	localtimerª   ra  rb  rc  r`  r„   )r©   ÚverboserL  r>  s       rD   r  zTarFile.listX  sf  € ğ 	‰Œàˆ?ØˆGÜˆGÚØ—<‘<Ğ'Ü Õ-ä¤§¡¨g¯l©lÓ ;Ô<Ü w§}¡}Ò'C¸¿¹Ñ'CØ'.§}¡}Ò'C¸¿¹Ğ'CğEô Fà—=‘=”? g§m¡m¤oÜ Ø$¨×(8Ñ(8¸'×:JÑ:JĞ'KÑKñ!Mõ Nô   ¨¯©Ñ 5Ô6Ø—=‘=Ğ(ÜĞ 5Õ6äĞ =Ü"&§.¡.°·±Ó"?ÀÀĞ"Cñ!Dô Eô ˜Ÿ™¨w¯}©}¬©ÀBÑGÔHáØ—=‘=”?Ü ¨×(8Ñ(8Ñ 8Ô9Ø—=‘=”?Ü 
+¨W×-=Ñ-=Ñ =Ô>ÜGñ5 rF   ©Úfilterc                ób  — | j                  d«       |€|}| j                  Bt        j                  j	                  |«      | j                  k(  r| j                  dd|z  «       y| j                  d|«       | j                  ||«      }|€| j                  dd|z  «       y|  ||«      }|€| j                  dd|z  «       y|j                  «       r(t        |d«      5 }| j                  ||«       ddd«       y|j                  «       r‰| j                  |«       |rut        t        j                  |«      «      D ]S  }| j                  t        j                  j                  ||«      t        j                  j                  ||«      ||¬	«       ŒU yy| j                  |«       y# 1 sw Y   yxY w)
+a!  Add the file `name' to the archive. `name' may be any type of file
+           (directory, fifo, symbolic link, etc.). If given, `arcname'
+           specifies an alternative name for the file in the archive.
+           Directories are added recursively by default. This can be avoided by
+           setting `recursive' to False. `filter' is a function
+           that expects a TarInfo object argument and returns the changed
+           TarInfo object, if it returns None the TarInfo object will be
+           excluded from the archive.
+        r  Nr.   ztarfile: Skipped %rr-   ztarfile: Unsupported type %rútarfile: Excluded %rr<  r¦  )r{  rª   r¢   r/   rF  Ú_dbgr¢  r_  rE  Úaddfilera  r\  ÚlistdirÚaddr  )r©   rª   r  Ú	recursiver§  r>  Úfs          rD   r­  zTarFile.add~  sq  € ğ 	‰EÔàˆ?ØˆGğ 9‰9Ğ ¤R§W¡W§_¡_°TÓ%:¸d¿i¹iÒ%GØI‰IaĞ.°Ñ5Ô6Øà	‰	!TÔğ —/‘/ $¨Ó0ˆàˆ?ØI‰IaĞ7¸$Ñ>Ô?Øğ ĞÙ˜W“oˆGØˆØ—	‘	˜!Ğ3°dÑ:Ô;Øğ =‰=Œ?Ü˜4 Ô&¨!Ø—‘˜W aÔ(÷ 'Ğ&ğ ]‰]Œ_ØL‰L˜Ô!ÙÜ¤§
+¡
+¨4Ó 0Ö1AØ—H‘HœRŸW™WŸ\™\¨$°Ó2´B·G±G·L±LÀÈ!Ó4LØ%¨fğ õ 6ñ 2ğ ğ L‰L˜Õ!÷ 'Ğ&ús   ÃF%Æ%F.c                 ó”  — | j                  d«       t        j                  |«      }|j                  | j                  | j                  | j
+                  «      }| j                  j                  |«       | xj                  t        |«      z  c_        | j                  }|t        || j                  |j                  |¬«       t        |j                  t        «      \  }}|dkD  r.| j                  j                  t        t        |z
+  z  «       |dz  }| xj                  |t        z  z  c_        | j                   j#                  |«       y)a  Add the TarInfo object `tarinfo' to the archive. If `fileobj' is
+           given, it should be a binary file, and tarinfo.size bytes are read
+           from it and added to the archive. You can create TarInfo objects
+           directly, or by using gettarinfo().
+        r  N)ry   r   r-   )r{  rˆ  r—  rb   rB   rC   rÅ   ru   r  r>   rK  rr   r1   rs   r  r?   rL  r  )r©   r>  rÅ   rk   ry   rz   r{   s          rD   r«  zTarFile.addfile±  sí   € ğ 	‰EÔä—)‘)˜GÓ$ˆàm‰m˜DŸK™K¨¯©¸¿¹ÓDˆØ‰×Ñ˜3ÔØŠ”s˜3“xÑØ× Ñ ˆàĞÜ˜ §¡¨w¯|©|ÀWÕMÜ & w§|¡|´YÓ ?ÑˆFIØ˜1Š}Ø—‘×"Ñ"¤3¬)°iÑ*?Ñ#@ÔAØ˜!‘ØKŠK˜6¤IÑ-Ñ-Kà‰×Ñ˜GÕ$rF   c                 ó  — |€M| j                   }|€"t        j                  dt        d¬«       t        S t        |t        «      rt        d«      ‚|S t        |«      r|S 	 t        |   S # t        $ r t        d|›d«      d ‚w xY w)Nz˜Python 3.14 will, by default, filter extracted tar archives and reject files or modify their metadata. Use the filter argument to control this behavior.r  )Ú
+stacklevelzrString names are not supported for TarFile.extraction_filter. Use a function such as tarfile.data_filter directly.zfilter z
+ not found)Úextraction_filterÚwarningsÚwarnÚDeprecationWarningr   r©  r¬  Ú	TypeErrorÚcallableÚ_NAMED_FILTERSrx  r<   )r©   r§  s     rD   Ú_get_filter_functionzTarFile._get_filter_functionÊ  s    € Øˆ>Ø×+Ñ+ˆFØˆ~Ü—‘ğJô '°1õ	6ô
+ ,Ğ+Ü˜&¤#Ô&Üğ6ó7ğ 7ğ ˆMÜFÔØˆMğ	GÜ! &Ñ)Ğ)øÜò 	GÜ˜w v j°
+Ğ;Ó<À$ĞFğ	Gús   ÁA' Á'B)Únumeric_ownerr§  c                ó@  — g }| j                  |«      }|€| }|D ]]  }| j                  |||«      }|€Œ|j                  «       r|j                  |«       | j	                  |||j                  «        |¬«       Œ_ |j                  d„ d¬«       |D ]e  }t        j                  j                  ||j                  «      }		 | j                  ||	|¬«       | j                  ||	«       | j                  ||	«       Œg y# t        $ r}
+| j                  |
+«       Y d}
+~
+Œˆd}
+~
+ww xY w)a˜  Extract all members from the archive to the current working
+           directory and set owner, modification time and permissions on
+           directories afterwards. `path' specifies a different directory
+           to extract to. `members' is optional and must be a subset of the
+           list returned by getmembers(). If `numeric_owner` is True, only
+           the numbers for user/group names are used and not the names.
+
+           The `filter` function will be called on each member just
+           before extraction.
+           It can return a changed TarInfo or None to skip the member.
+           String names of common filters are accepted.
+        N©Ú	set_attrsr»  c                 ó   — | j                   S r®   r~  )r@  s    rD   Ú<lambda>z$TarFile.extractall.<locals>.<lambda>	  s   €  q§v¢vrF   T)rW  Úreverse)r»  )rº  Ú_get_extract_tarinfora  r  Ú_extract_oneÚsortr¢   r/   r  rª   ÚchownÚutimeÚchmodr   Ú_handle_nonfatal_error)r©   r/   rL  r»  r§  ÚdirectoriesÚfilter_functionre  r>  Údirpathr  s              rD   Ú
+extractallzTarFile.extractallá  s  € ğ ˆà×3Ñ3°FÓ;ˆØˆ?ØˆGãˆFØ×/Ñ/°¸ÈÓNˆGØˆØØ}‰}Œğ ×"Ñ" 7Ô+Ø×Ñ˜g t¸7¿=¹=»?Ğ7JØ,9ğ õ ;ğ ğ 	×ÑÑ-°tĞÔ<ó #ˆGÜ—g‘g—l‘l 4¨¯©Ó6ˆGğ/Ø—
+‘
+˜7 G¸=
+ÔIØ—
+‘
+˜7 GÔ,Ø—
+‘
+˜7 GÕ,ñ #øô  ò /Ø×+Ñ+¨A×.Ñ.ûğ/ús   Â>8C9Ã9	DÄDÄDc                óz   — | j                  |«      }| j                  |||«      }|| j                  ||||«       yy)a¯  Extract a member from the archive to the current working directory,
+           using its full name. Its file information is extracted as accurately
+           as possible. `member' may be a filename or a TarInfo object. You can
+           specify a different directory using `path'. File attributes (owner,
+           mtime, mode) are set unless `set_attrs' is False. If `numeric_owner`
+           is True, only the numbers for user/group names are used and not
+           the names.
+
+           The `filter` function will be called before extraction.
+           It can return a changed TarInfo or None to skip the member.
+           String names of common filters are accepted.
+        N)rº  rÂ  rÃ  )r©   re  r/   r¾  r»  r§  rÊ  r>  s           rD   ÚextractzTarFile.extract	  sG   € ğ ×3Ñ3°FÓ;ˆØ×+Ñ+¨F°OÀTÓJˆØĞØ×Ñ˜g t¨Y¸ÕFğ rF   c                 óğ  — t        |t        «      r| j                  |«      }n|}|}	  |||«      }|€ | j                  dd|j                  z  «       y|j                  «       rDt        j                  |«      }t        j                  j                  ||j                  «      |_        |S # t        t        f$ r}| j                  |«       Y d}~Œd}~wt        $ r}| j                  |«       Y d}~Œ¿d}~ww xY w)z@Get filtered TarInfo (or None) from member, which might be a strNr.   r©  )r©  r¬  ry  rÒ   r   Ú_handle_fatal_errorr   rÈ  rª  rª   r`  rˆ  r¢   r/   r  rc  ry  )r©   re  rÊ  r/   r>  Ú
+unfilteredr  s          rD   rÂ  zTarFile._get_extract_tarinfo!	  sÒ   € äfœcÔ"Ø—n‘n VÓ,‰GàˆGàˆ
+ğ	+Ù% g¨tÓ4ˆGğ
+ ˆ?ØI‰IaĞ/°*·/±/ÑAÔBØà=‰=Œ?Ü—i‘i Ó(ˆGÜ#%§7¡7§<¡<°°g×6FÑ6FÓ#GˆGÔ Øˆøô œĞ%ò 	(Ø×$Ñ$ Q×'Ñ'ûÜò 	+Ø×'Ñ'¨×*Ñ*ûğ	+ús#   ¨	B) Â)C5Â8CÃC5ÃC0Ã0C5c                 ó4  — | j                  d«       	 | j                  |t        j                  j	                  ||j
+                  «      ||¬«       y# t        $ r}| j                  |«       Y d}~yd}~wt        $ r}| j                  |«       Y d}~yd}~ww xY w)z%Extract from filtered tarinfo to diskrŸ   r½  N)
+r{  Ú_extract_memberr¢   r/   r  rª   rÒ   rĞ  r   rÈ  )r©   r>  r/   r¾  r»  r  s         rD   rÃ  zTarFile._extract_one8	  s€   € à‰CÔğ	+Ø× Ñ  ¬"¯'©'¯,©,°t¸W¿\¹\Ó*JØ+4Ø/<ğ !õ >øô ò 	(Ø×$Ñ$ Q×'Ñ'ûÜò 	+Ø×'Ñ'¨×*Ñ*ûğ	+ús#   “=A Á	BÁA0Á0BÁ<BÂBc                 óN   — | j                   dkD  r‚ | j                  dd|z  «       y)z=Handle non-fatal error (ExtractError) according to errorlevelr-   útarfile: %sN)rJ  rª  ©r©   r  s     rD   rÈ  zTarFile._handle_nonfatal_errorE	  s$   € à?‰?˜QÒØàI‰Ia˜¨Ñ*Õ+rF   c                 óL  — | j                   dkD  r‚ t        |t        «      rY|j                  € | j	                  dd|j
+                  z  «       y| j	                  dd|j
+                  ›d|j                  ›«       y| j	                  ddt        |«      j                  ›d|›«       y)z1Handle "fatal" error according to self.errorlevelr   Nr-   rÕ  z	tarfile: r   )rJ  r©  rÒ   Úfilenamerª  Ústrerrorrt  rˆ   rÖ  s     rD   rĞ  zTarFile._handle_fatal_errorL	  st   € à?‰?˜QÒØÜ˜œ7Ô#Øz‰zĞ!Ø—	‘	˜!˜]¨Q¯Z©ZÑ7Õ8à—	‘	™!°·³¸Q¿ZºZĞHÕIàI‰I‘a¬T°!«W×-=Ó-=¹qĞAÕBrF   c                 ó   — | j                  d«       t        |t        «      r| j                  |«      }n|}|j	                  «       s|j
+                  t        vr| j                  | |«      S |j                  «       s|j                  «       rEt        | j                  t        «      rt        d«      ‚| j                  | j                  |«      «      S y)a\  Extract a member from the archive as a file object. `member' may be
+           a filename or a TarInfo object. If `member' is a regular file or
+           a link, an io.BufferedReader object is returned. For all other
+           existing members, None is returned. If `member' does not appear
+           in the archive, KeyError is raised.
+        rŸ   z'cannot extract (sym)link as file objectN)r{  r©  r¬  ry  r_  rt  rî  Ú
+fileobjectr`  rb  rÅ   r¶   r
+   ÚextractfileÚ_find_link_target)r©   re  r>  s      rD   rÜ  zTarFile.extractfileX	  s¢   € ğ 	‰CÔäfœcÔ"Ø—n‘n VÓ,‰GàˆGà=‰=Œ?˜gŸl™l´/ÑAà—?‘? 4¨Ó1Ğ1à]‰]Œ_ §¡¤Ü˜$Ÿ,™,¬Ô0ô "Ğ"KÓLĞLğ ×'Ñ'¨×(>Ñ(>¸wÓ(GÓHĞHğ rF   c                 ó‚  — |j                  d«      }|j                  dt        j                  «      }t        j                  j                  |«      }|r4t        j                  j                  |«      st        j                  |«       |j                  «       s|j                  «       r,| j                  d|j                  ›d|j                  ›«       n| j                  d|j                  «       |j                  «       r| j                  ||«       nã|j                  «       r| j!                  ||«       nÀ|j#                  «       r| j%                  ||«       n|j'                  «       s|j)                  «       r| j+                  ||«       nj|j                  «       s|j                  «       r| j-                  ||«       n7|j.                  t0        vr| j3                  ||«       n| j                  ||«       |rI| j5                  |||«       |j                  «       s%| j7                  ||«       | j9                  ||«       yyy)z\Extract the TarInfo object tarinfo to a physical
+           file called targetpath.
+        rW  r-   z -> N)rÜ  rß   r¢   r[  r/   rd  rD  Úmakedirsr`  rb  rª  rª   rc  r_  Úmakefilera  Úmakedirr/  Úmakefifor*  r,  ÚmakedevÚmakelinkrt  rî  ÚmakeunknownrÅ  rÇ  rÆ  )r©   r>  Ú
+targetpathr¾  r»  Ú	upperdirss         rD   rÓ  zTarFile._extract_memberx	  s  € ğ  ×&Ñ& sÓ+ˆ
+Ø×'Ñ'¨¬R¯V©VÓ4ˆ
+ô —G‘G—O‘O JÓ/ˆ	ÙœRŸW™WŸ^™^¨IÔ6ô K‰K˜	Ô"à=‰=Œ?˜gŸm™mœoØI‰Ia w§|£|°W×5EÒ5EĞFÕGàI‰Ia˜Ÿ™Ô&à=‰=Œ?ØM‰M˜' :Õ.Ø]‰]Œ_ØL‰L˜ *Õ-Ø^‰^ÔØM‰M˜' :Õ.Ø]‰]Œ_ §¡¤ØL‰L˜ *Õ-Ø]‰]Œ_ §¡¤ØM‰M˜' :Õ.Ø\‰\¤Ñ0Ø×Ñ˜W jÕ1àM‰M˜' :Ô.áØJ‰Jw 
+¨MÔ:Ø—=‘=”?Ø—
+‘
+˜7 JÔ/Ø—
+‘
+˜7 JÕ/ğ #ğ rF   c                 óÔ   — 	 |j                   €t        j                  |«       yt        j                  |d«       y# t        $ r# t        j                  j                  |«      s‚ Y yw xY w)z,Make a directory called targetpath.
+        NiÀ  )r«   r¢   ÚmkdirÚFileExistsErrorr/   ra  ©r©   r>  ræ  s      rD   rá  zTarFile.makedir©	  sT   € ğ
+	Ø|‰|Ğ#ä—‘˜Õ$ô —‘˜ UÕ+øÜò 	Ü—7‘7—=‘= Ô,Øñ -ğ	ús   ‚!; ¤; »)A'Á&A'c           	      óÆ  — | j                   }|j                  |j                  «       | j                  }t	        |d«      5 }|j
+                  d|j
+                  D ])  \  }}|j                  |«       t        |||t        |«       Œ+ |j                  |j                  «       |j                  «        nt        |||j                  t        |«       ddd«       y# 1 sw Y   yxY w)z'Make a file called targetpath.
+        r=  N)
+rÅ   rş   r:  rK  rE  r;  rr   r   r1   Útruncate)r©   r>  ræ  Úsourcery   Útargetr  r1   s           rD   rà  zTarFile.makefile¸	  sª   € ğ —‘ˆØ‰G×'Ñ'Ô(Ø×"Ñ"ˆÜz 4Ô(¨FØ~‰~Ğ)Ø$+§N¤N‘LF˜DØ—K‘K Ô'Ü ¨°´iÀÕIğ %3ğ —‘˜GŸL™LÔ)Ø—‘Õ!ä˜F F¨G¯L©L¼)ÀWÔM÷ )×(Ñ(ús   Á BCÃC c                 óf   — | j                  ||«       | j                  dd|j                  z  «       y)zYMake a file from a TarInfo object with an unknown type
+           at targetpath.
+        r-   z9tarfile: Unknown file type %r, extracted as regular file.N)rà  rª  rt  rë  s      rD   rå  zTarFile.makeunknownÈ	  s3   € ğ 	‰g˜zÔ*Ø	‰	!ğ 2Ø4;·L±LñAõ 	BrF   c                 ód   — t        t        d«      rt        j                  |«       yt        d«      ‚)z'Make a fifo called targetpath.
+        Úmkfifozfifo not supported by systemN)r§   r¢   rò  r   rë  s      rD   râ  zTarFile.makefifoĞ	  s&   € ô ”2xÔ ÜI‰IjÕ!äĞ=Ó>Ğ>rF   c                 óf  — t        t        d«      rt        t        d«      st        d«      ‚|j                  }|€d}|j	                  «       r|t
+        j                  z  }n|t
+        j                  z  }t        j                  ||t        j                  |j                  |j                  «      «       y)z<Make a character or block device called targetpath.
+        Úmknodrã  z'special devices not supported by systemNrY  )r§   r¢   r   r«   r,  r†  ÚS_IFBLKÚS_IFCHRrô  rã  ru  rv  )r©   r>  ræ  r«   s       rD   rã  zTarFile.makedevØ	  s†   € ô ”r˜7Ô#¬7´2°yÔ+AÜĞHÓIĞIà|‰|ˆØˆ<àˆDØ=‰=Œ?Ø”D—L‘LÑ ‰Dà”D—L‘LÑ ˆDä
+‰˜TÜ—‘˜G×,Ñ,¨g×.>Ñ.>Ó?õ	ArF   c                 ó:  — 	 |j                  «       rUt        j                  j                  |«      rt        j                  |«       t        j
+                  |j                  |«       yt        j                  j                  |j                  «      r!t        j                  |j                  |«       y| j                  | j                  |«      |«       y# t        $ r> 	 | j                  | j                  |«      |«       Y y# t        $ r t        d«      d‚w xY ww xY w)zµMake a (symbolic) link called targetpath. If it cannot be created
+          (platform limitation), we try to make a copy of the referenced file
+          instead of a link.
+        z%unable to resolve link inside archiveN)rb  r¢   r/   ÚlexistsÚunlinkÚsymlinkrc  rD  ry  ÚlinkrÓ  rİ  Úsymlink_exceptionrx  r   rë  s      rD   rä  zTarFile.makelinkê	  sŞ   € ğ
+	Và}‰}ŒÜ—7‘7—?‘? :Ô.ä—I‘I˜jÔ)Ü—
+‘
+˜7×+Ñ+¨ZÕ8ä—7‘7—>‘> '×"6Ñ"6Ô7Ü—G‘G˜G×0Ñ0°*Õ=à×(Ñ(¨×)?Ñ)?ÀÓ)HØ)3õ5øä ò 	VğVØ×$Ñ$ T×%;Ñ%;¸GÓ%DØ%/ö1øäò VÜ"Ğ#JÓKĞQUĞUğVúğ		Vús+   ‚A$C Á'A	C Â1!C Ã	DÃ!D Ä DÄDc                 ó„  — t        t        d«      rõt        j                  «       dk(  rİ|j                  }|j                  }|sj	 t
+        r.|j                  r"t        j                  |j                  «      d   }	 t        r.|j                  r"t        j                  |j                  «      d   }|€d}|€d}	 |j                  «       r(t        t        d«      rt        j                  |||«       yt        j                  |||«       yyy# t        $ r Y Œ›w xY w# t        $ r Y Œuw xY w# t        $ r}t!        d«      |‚d}~ww xY w)zğSet owner of targetpath according to tarinfo. If numeric_owner
+           is True, use .gid/.uid instead of .gname/.uname. If numeric_owner
+           is False, fall back to .gid/.uid when the search based on name
+           fails.
+        Úgeteuidr   r.   NrH   Úlchownzcould not change owner)r§   r¢   rş  r4   r3   rš  r6   Úgetgrnamrx  r˜  r5   Úgetpwnamrb  rÿ  rÅ  rÒ   r   )r©   r>  ræ  r»  ÚgÚur  s          rD   rÅ  zTarFile.chown
+  s  € ô ”2yÔ!¤b§j¡j£l°aÒ&7à—‘ˆAØ—‘ˆAÙ ğİ˜wŸ}š}ÜŸL™L¨¯©Ó7¸Ñ:˜ğİ˜wŸ}š}ÜŸL™L¨¯©Ó7¸Ñ:˜ğ ˆyØØˆyØğDØ—=‘=”?¤w¬r°8Ô'<Ü—I‘I˜j¨!¨QÕ/ä—H‘H˜Z¨¨AÕ.ğ/ '8Ğ!øô  ò Ùğûô
+  ò Ùğûô ò DÜ"Ğ#;Ó<À!ĞCûğDúsB   Á4D Á84D Â57D% Ã-D% Ä	DÄDÄ	D"Ä!D"Ä%	D?Ä.D:Ä:D?c                 óš   — |j                   €y	 t        j                  ||j                   «       y# t        $ r}t	        d«      |‚d}~ww xY w)zASet file permissions of targetpath according to tarinfo.
+        Nzcould not change mode)r«   r¢   rÇ  rÒ   r   )r©   r>  ræ  r  s       rD   rÇ  zTarFile.chmod$
+  sF   € ğ <‰<ĞØğ	?ÜH‰HZ §¡Õ.øÜò 	?ÜĞ6Ó7¸QĞ>ûğ	?ús    0 °	A
+¹AÁA
+c                 ó°   — |j                   }|€yt        t        d«      sy	 t        j                  |||f«       y# t        $ r}t        d«      |‚d}~ww xY w)zBSet modification time of targetpath according to tarinfo.
+        NrÆ  z"could not change modification time)r2   r§   r¢   rÆ  rÒ   r   )r©   r>  ræ  r2   r  s        rD   rÆ  zTarFile.utime.
+  sZ   € ğ —‘ˆØˆ
