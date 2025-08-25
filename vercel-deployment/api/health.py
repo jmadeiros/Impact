@@ -5,24 +5,13 @@ Minimal health check without complex dependencies
 import json
 import os
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler
 
-def handler(request):
+class handler(BaseHTTPRequestHandler):
     """
     Minimal Vercel serverless function handler for health check
     """
     try:
-        # Handle CORS for browser requests
-        if hasattr(request, 'method') and request.method == 'OPTIONS':
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                },
-                'body': ''
-            }
-        
         # Basic health response
         health_response = {
             'status': 'healthy',
