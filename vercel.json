@@ -1,28 +1,22 @@
 {
   "version": 2,
   "name": "rag-survey-system",
-  "builds": [
-    {
-      "src": "vercel-deployment/api/*.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/vercel-deployment/api/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/vercel-deployment/api/health"
-    }
-  ],
   "functions": {
     "vercel-deployment/api/*.py": {
       "runtime": "python3.9",
       "maxDuration": 25
     }
   },
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/vercel-deployment/api/$1.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/vercel-deployment/api/health.py"
+    }
+  ],
   "env": {
     "PYTHONPATH": "./vercel-deployment/lib"
   }
